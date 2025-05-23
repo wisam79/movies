@@ -1,122 +1,184 @@
-from aiogram import Bot, Dispatcher, executor, types
-import logging
 import os
-import sqlite3
-from movie_api import get_movies_by_genre, search_movie, get_movie_details
-import random
+import asyncio
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.enums import ParseMode
+from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+import requests
+import redis.asyncio as redis
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
+from datetime import datetime, time
+from dotenv import load_dotenv
 
-API_TOKEN = os.getenv("BOT_TOKEN")
-logging.basicConfig(level=logging.INFO)
+# تحميل الإعدادات
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(',')
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
+# تكوين قاعدة البيانات
+Base = declarative_base()
+engine = create_engine(os.getenv("DATABASE_URL"))
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Connect to SQLite DB
-conn = sqlite3.connect('movies.db')
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS favorites (
-    user_id INTEGER,
-    movie_id INTEGER,
-    title TEXT,
-    overview TEXT,
-    rating REAL
-)''')
-conn.commit()
+# نماذج قاعدة البيانات
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False)
+    username = Column(String(50))
+    first_name = Column(String(50))
+    last_name = Column(String(50))
+    notifications = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-# Genre mapping
-genre_map = {
-    'أكشن': 28,
-    'كوميديا': 35,
-    'دراما': 18,
-    'رعب': 27,
-    'رومانسي': 10749
-}
+class FavoriteMovie(Base):
+    __tablename__ = "favorite_movies"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    movie_id = Column(Integer, nullable=False)
+    movie_title = Column(String(100), nullable=False)
+    added_at = Column(DateTime, default=datetime.utcnow)
 
-@dp.message_handler(commands=['start'])
-async def send_welcome(message: types.Message):
-    await message.reply("مرحباً بك في MovieGenieBot!\n\nأوامر الاستخدام:\n/genre - اختر نوع الفيلم\n/search - ابحث عن فيلم\n/favorites - قائمة المفضلة\n/daily - اقتراح يومي\n/mood - اقتراح حسب المزاج")
+# إنشاء الجداول
+Base.metadata.create_all(bind=engine)
 
-@dp.message_handler(commands=['genre'])
-async def genre_handler(message: types.Message):
-    buttons = [types.KeyboardButton(text=key) for key in genre_map.keys()]
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True).add(*buttons)
-    await message.reply("اختر نوع الفيلم:", reply_markup=keyboard)
+# خدمة TMDb
+class TMDBService:
+    BASE_URL = "https://api.themoviedb.org/3"
+    
+    @staticmethod
+    async def get_movies(genre: str, mood: str = None):
+        genres = {
+            "أكشن": 28, "كوميدي": 35, "دراما": 18, 
+            "رومانسي": 10749, "خيال علمي": 878
+        }
+        params = {
+            'api_key': TMDB_API_KEY,
+            'with_genres': genres.get(genre, 28),
+            'language': 'ar'
+        }
+        try:
+            response = requests.get(f"{TMDBService.BASE_URL}/discover/movie", params=params)
+            movies = response.json().get('results', [])[:5]
+            return [
+                {
+                    'id': m['id'],
+                    'title': m.get('title', 'لا يوجد عنوان'),
+                    'year': m.get('release_date', '')[:4],
+                    'rating': m.get('vote_average', 0),
+                    'poster': f"https://image.tmdb.org/t/p/w500{m['poster_path']}" if m.get('poster_path') else None
+                } for m in movies
+            ]
+        except:
+            return None
+    
+    @staticmethod
+    async def search_movie(query: str):
+        try:
+            response = requests.get(
+                f"{TMDBService.BASE_URL}/search/movie",
+                params={
+                    'api_key': TMDB_API_KEY,
+                    'query': query,
+                    'language': 'ar'
+                }
+            )
+            movies = response.json().get('results', [])[:3]
+            return [
+                {
+                    'id': m['id'],
+                    'title': m.get('title', 'لا يوجد عنوان'),
+                    'year': m.get('release_date', '')[:4]
+                } for m in movies
+            ]
+        except:
+            return None
 
-@dp.message_handler(lambda msg: msg.text in genre_map)
-async def show_movies(message: types.Message):
-    movies = get_movies_by_genre(genre_map[message.text])
-    reply = ""
-    for m in movies[:5]:
-        reply += f"\n*{m['title']}*\n{m['overview'][:150]}...\n⭐️ التقييم: {m.get('vote_average', 'غير متوفر')}\n/like_{m['id']}\n\n"
-    await message.reply(reply or "لا توجد أفلام حالياً.", parse_mode='Markdown', reply_markup=types.ReplyKeyboardRemove())
+# إنشاء البوت
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+storage = RedisStorage(redis=redis.Redis())
+dp = Dispatcher(storage=storage)
 
-@dp.message_handler(lambda msg: msg.text.startswith("/like_"))
-async def add_to_favorites(message: types.Message):
-    movie_id = int(message.text.split("_")[-1])
-    details = get_movie_details(movie_id)
-    user_id = message.from_user.id
-    with sqlite3.connect('movies.db') as conn:
-        c = conn.cursor()
-        c.execute("INSERT INTO favorites (user_id, movie_id, title, overview, rating) VALUES (?, ?, ?, ?, ?)",
-                  (user_id, movie_id, details['title'], details['overview'], details.get('vote_average')))
-        conn.commit()
-    await message.reply(f"تمت إضافة *{details['title']}* إلى المفضلة.", parse_mode='Markdown')
+# لوحات المفاتيح
+def main_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        types.KeyboardButton(text="🎬 اقتراح فيلم"),
+        types.KeyboardButton(text="🔍 بحث عن فيلم")
+    )
+    builder.row(
+        types.KeyboardButton(text="💖 قائمتي المفضلة"),
+        types.KeyboardButton(text="⚙️ الإعدادات")
+    )
+    return builder.as_markup(resize_keyboard=True)
 
-@dp.message_handler(commands=['favorites'])
-async def show_favorites(message: types.Message):
-    user_id = message.from_user.id
-    with sqlite3.connect('movies.db') as conn:
-        c = conn.cursor()
-        c.execute("SELECT title, overview, rating FROM favorites WHERE user_id=? ORDER BY rowid DESC LIMIT 5", (user_id,))
-        rows = c.fetchall()
-    if not rows:
-        await message.reply("قائمة المفضلة فارغة.")
+def genres_keyboard():
+    builder = ReplyKeyboardBuilder()
+    genres = ["أكشن", "كوميدي", "دراما", "رومانسي", "خيال علمي"]
+    for genre in genres:
+        builder.add(types.KeyboardButton(text=genre))
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
+
+# المعالجات الأساسية
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await message.answer(
+        "مرحباً بك في بوت أفلامي! 🎬\n"
+        "يمكنني مساعدتك في إيجاد أفلام رائعة تناسب ذوقك.\n"
+        "استخدم الأزرار أدناه للبدء:",
+        reply_markup=main_keyboard()
+    )
+
+@dp.message(F.text == "🎬 اقتراح فيلم")
+async def suggest_movie(message: types.Message):
+    await message.answer("اختر نوع الفيلم:", reply_markup=genres_keyboard())
+
+@dp.message(F.text.in_(["أكشن", "كوميدي", "دراما", "رومانسي", "خيال علمي"]))
+async def send_movie_suggestion(message: types.Message):
+    movies = await TMDBService.get_movies(message.text)
+    if not movies:
+        await message.answer("عذراً، لم أتمكن من العثور على أفلام.", reply_markup=main_keyboard())
         return
-    reply = ""
-    for title, overview, rating in rows:
-        reply += f"\n*{title}*\n{overview[:150]}...\n⭐️ {rating or '؟'}\n\n"
-    await message.reply(reply, parse_mode='Markdown')
+    
+    response = "🎬 إليك بعض الاقتراحات:\n\n"
+    for movie in movies:
+        response += f"📽 {movie['title']} ({movie['year']})\n⭐ التقييم: {movie['rating']}/10\n\n"
+    
+    await message.answer(response, reply_markup=main_keyboard())
+    
+    if movies[0]['poster']:
+        await message.answer_photo(movies[0]['poster'])
 
-@dp.message_handler(commands=['search'])
-async def search_command(message: types.Message):
-    await message.reply("أدخل اسم الفيلم للبحث عنه:")
+# الإشعارات اليومية
+async def send_daily_notification():
+    db = SessionLocal()
+    users = db.query(User).filter(User.notifications == True).all()
+    movies = await TMDBService.get_movies("أكشن")  # يمكن تغيير هذا لاختيار عشوائي
+    
+    if movies:
+        for user in users:
+            try:
+                await bot.send_message(
+                    user.telegram_id,
+                    f"🎬 فيلم اليوم:\n{movies[0]['title']} ({movies[0]['year']})\n⭐ {movies[0]['rating']}/10",
+                    reply_markup=main_keyboard()
+                )
+            except:
+                pass
 
-@dp.message_handler(lambda message: message.reply_to_message and 'أدخل اسم الفيلم' in message.reply_to_message.text)
-async def handle_search(message: types.Message):
-    results = search_movie(message.text)
-    if results:
-        reply = ""
-        for m in results[:5]:
-            reply += f"*{m['title']}* ({m.get('release_date', '')[:4]})\n{m['overview'][:150]}...\n⭐️ {m.get('vote_average', '؟')}\n/like_{m['id']}\n\n"
-    else:
-        reply = "لم يتم العثور على نتائج."
-    await message.reply(reply, parse_mode='Markdown')
+# التشغيل الرئيسي
+async def main():
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_daily_notification, 'cron', hour=12, minute=0)
+    scheduler.start()
+    
+    await dp.start_polling(bot)
 
-@dp.message_handler(commands=['daily'])
-async def daily_suggestion(message: types.Message):
-    genre_id = random.choice(list(genre_map.values()))
-    movie = random.choice(get_movies_by_genre(genre_id))
-    reply = f"*{movie['title']}*\n{movie['overview'][:150]}...\n⭐️ التقييم: {movie.get('vote_average', '؟')}\n/like_{movie['id']}"
-    await message.reply(reply, parse_mode='Markdown')
-
-@dp.message_handler(commands=['mood'])
-async def ask_mood(message: types.Message):
-    await message.reply("كيف هو شعورك الآن؟ (مثال: طفشان، متوتر، سعيد...)")
-
-@dp.message_handler(lambda m: m.reply_to_message and 'كيف هو شعورك' in m.reply_to_message.text)
-async def mood_response(message: types.Message):
-    mood = message.text.strip().lower()
-    if 'طفشان' in mood:
-        genre_id = 35
-    elif 'متوتر' in mood:
-        genre_id = 18
-    elif 'حزين' in mood:
-        genre_id = 10749
-    else:
-        genre_id = random.choice(list(genre_map.values()))
-    movie = random.choice(get_movies_by_genre(genre_id))
-    reply = f"*{movie['title']}*\n{movie['overview'][:150]}...\n⭐️ {movie.get('vote_average', '؟')}\n/like_{movie['id']}"
-    await message.reply(reply, parse_mode='Markdown')
-
-if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+if __name__ == "__main__":
+    asyncio.run(main())
